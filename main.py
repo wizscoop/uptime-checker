@@ -1,3 +1,4 @@
+import concurrent.futures
 import csv
 from datetime import datetime
 import os
@@ -9,21 +10,33 @@ TARGETS_FILE = "targets.txt"
 LOG_FILE = "uptime_log.csv"
 CHECK_INTERVAL_SECONDS = 30
 TIMEOUT_SECONDS = 5
+MAX_WORKERS = 10  # Number of parallel threads
+
+# ANSI Terminal Colors
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+# In-memory state tracking to detect state changes between runs
+previous_states: dict[str, str] = {}
 
 
 def load_targets(file_path: str = TARGETS_FILE) -> list[str]:
-    """Reads URLs from a file, ignoring empty lines and comments."""
+    """Reads target URLs from a file, creating defaults if missing."""
     if not os.path.exists(file_path):
-        # Create a starter file if it doesn't exist yet
         sample_targets = [
             "https://github.com",
             "https://google.com",
             "https://httpstat.us/500",  # Simulates an internal server error
-            "https://httpstat.us/404",  # Simulates a missing page
+            "https://httpstat.us/404",  # Simulates a missing resource
+            "https://nonexistent-domain-test123.org",  # Simulates DNS failure
         ]
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("\n".join(sample_targets) + "\n")
-        print(f"[i] Created default '{file_path}' with sample URLs.\n")
+        print(f"{CYAN}[i] Created default '{file_path}' with sample URLs.{RESET}\n")
         return sample_targets
 
     with open(file_path, "r", encoding="utf-8") as f:
@@ -41,7 +54,7 @@ def log_result(
     latency_ms: str | int,
     log_file: str = LOG_FILE,
 ):
-    """Appends check results with an ISO timestamp into a CSV spreadsheet."""
+    """Appends response metrics into a CSV log file."""
     file_exists = os.path.exists(log_file)
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -60,61 +73,122 @@ def log_result(
         )
 
 
-def check_site(url: str):
-    """Sends a GET request, tracks response latency, and handles errors."""
+def check_site(url: str) -> dict:
+    """Pings a single URL and returns structured metrics."""
     try:
         start_time = time.perf_counter()
         response = requests.get(url, timeout=TIMEOUT_SECONDS)
         latency_ms = round((time.perf_counter() - start_time) * 1000)
 
-        if response.status_code == 200:
-            status = "UP"
-            print(f"  [UP]      {url:<32} {response.status_code} ({latency_ms}ms)")
-        else:
-            status = "WARN"
-            print(f"  [WARN]    {url:<32} {response.status_code} ({latency_ms}ms)")
-
-        log_result(url, status, response.status_code, latency_ms)
+        status = "UP" if response.status_code == 200 else "WARN"
+        return {
+            "url": url,
+            "status": status,
+            "code": response.status_code,
+            "latency": latency_ms,
+            "detail": f"{response.status_code} ({latency_ms}ms)",
+        }
 
     except requests.exceptions.Timeout:
-        print(f"  [TIMEOUT] {url:<32} Exceeded {TIMEOUT_SECONDS}s limit")
-        log_result(url, "TIMEOUT", "TIMEOUT", "N/A")
+        return {
+            "url": url,
+            "status": "TIMEOUT",
+            "code": "TIMEOUT",
+            "latency": "N/A",
+            "detail": f"Timed out after {TIMEOUT_SECONDS}s",
+        }
 
     except requests.exceptions.ConnectionError:
-        print(f"  [DOWN]    {url:<32} Unreachable / DNS failure")
-        log_result(url, "DOWN", "DOWN", "N/A")
+        return {
+            "url": url,
+            "status": "DOWN",
+            "code": "DOWN",
+            "latency": "N/A",
+            "detail": "Unreachable / DNS error",
+        }
 
     except requests.exceptions.RequestException as err:
-        print(f"  [ERROR]   {url:<32} {err}")
-        log_result(url, "ERROR", "ERR", "N/A")
+        return {
+            "url": url,
+            "status": "ERROR",
+            "code": "ERR",
+            "latency": "N/A",
+            "detail": str(err),
+        }
+
+
+def process_result(result: dict):
+    """Prints colorized output, checks for state changes, and writes to log."""
+    url = result["url"]
+    status = result["status"]
+    last_status = previous_states.get(url)
+
+    # 1. State-transition detection
+    if last_status is not None and last_status != status:
+        if status in ("DOWN", "TIMEOUT", "WARN") and last_status == "UP":
+            print(
+                f"  {RED}{BOLD}>>> STATE ALERT: {url} transitioned from {last_status} to {status}! <<<{RESET}"
+            )
+        elif status == "UP" and last_status in ("DOWN", "TIMEOUT", "WARN"):
+            print(
+                f"  {GREEN}{BOLD}>>> RECOVERY: {url} is back UP (was {last_status})! <<<{RESET}"
+            )
+
+    previous_states[url] = status
+
+    # 2. Color formatting
+    if status == "UP":
+        tag = f"{GREEN}[UP]{RESET}"
+    elif status == "WARN":
+        tag = f"{YELLOW}[WARN]{RESET}"
+    else:
+        tag = f"{RED}[{status}]{RESET}"
+
+    # 3. Print aligned line output
+    print(f"  {tag:<18} {url:<45} {result['detail']}")
+
+    # 4. Save to CSV
+    log_result(url, status, result["code"], result["latency"])
+
+
+def run_batch_checks(targets: list[str]):
+    """Executes checks across all URLs concurrently."""
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+        # executor.map runs checks in parallel and yields them in original order
+        results = executor.map(check_site, targets)
+        for res in results:
+            process_result(res)
 
 
 def main():
     targets = load_targets()
-
     if not targets:
-        print(f"[!] No valid URLs found in {TARGETS_FILE}. Exiting.")
+        print(f"{RED}[!] No targets found in {TARGETS_FILE}. Exiting.{RESET}")
         return
 
-    print("====================================================")
-    print(f" Monitoring {len(targets)} URLs every {CHECK_INTERVAL_SECONDS} seconds")
-    print(f" Logging results to: {LOG_FILE}")
-    print(" Press Ctrl + C to stop the monitor")
-    print("====================================================\n")
+    print(f"{BOLD}===================================================={RESET}")
+    print(
+        f"{CYAN} Parallel Uptime Monitor: Tracking {len(targets)} endpoints{RESET}"
+    )
+    print(f" Checks running concurrently every {CHECK_INTERVAL_SECONDS} seconds")
+    print(f" Saving logs to: {LOG_FILE}")
+    print(f" Press {YELLOW}Ctrl + C{RESET} to exit cleanly")
+    print(f"{BOLD}===================================================={RESET}\n")
 
     try:
         while True:
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{current_time}] Checking endpoints:")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{BOLD}[{timestamp}] Scanning targets...{RESET}")
 
-            for url in targets:
-                check_site(url)
+            run_batch_checks(targets)
 
             print(f"\nNext check in {CHECK_INTERVAL_SECONDS}s...\n")
             time.sleep(CHECK_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
-        print("\n[!] Monitor halted by user. Exiting cleanly.")
+        print(f"\n{YELLOW}[!] Monitor stopped by user. Goodbye!{RESET}")
 
 
 if __name__ == "__main__":
